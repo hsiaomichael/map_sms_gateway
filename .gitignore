@@ -1,0 +1,13 @@
+# Real config files - contain private IPs and MSISDNs - never commit these
+
+config/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor files
+*.swp
+*.swo
+.vscode/
