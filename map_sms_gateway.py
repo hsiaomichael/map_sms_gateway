@@ -26,6 +26,10 @@ CFG: Dict[str, Any] = {}
 # or substring (*abc*).  Longest match wins.
 SRI_TABLE: Dict[str, Dict[str, str]] = {}
 
+# Prefix / wildcard based response rules loaded from INI [response_rule:*]
+# Each rule may override SRI-SM success data or force an SRI-SM / MT-FSM MAP error.
+RESPONSE_RULES: List[Dict[str, Any]] = []
+
 # Menu presets loaded from INI [menu_presets]
 MENU_PRESETS: Dict[str, str] = {}
 
@@ -95,12 +99,13 @@ OID_TCAP_DIALOGUE   = "0.0.17.773.1.1.1"
 # MAP error codes — localValue assignments from MAP-Errors ASN.1 module
 # (3GPP TS 29.002, confirmed against Wireshark MAP dissector)
 MAP_ERROR_CODES: Dict[int, str] = {
+    # Generic / identification / subscription
     1:  'unknownSubscriber',
     2:  'unknownBaseStation',
     3:  'unknownMSC',
     4:  'unidentifiedSubscriber',
     5:  'unknownEquipment',
-    6:  'roamingNotAllowed',
+    6:  'absentSubscriberSM',
     7:  'illegalSubscriber',
     8:  'bearerServiceNotProvisioned',
     9:  'teleserviceNotProvisioned',
@@ -115,45 +120,52 @@ MAP_ERROR_CODES: Dict[int, str] = {
     18: 'ss-Incompatibility',
     19: 'facilityNotSupported',
     20: 'noHandoverNumberAvailable',
-    21: 'subsequentHandoverFailure',
-    22: 'absentSubscriber',
+    21: 'facilityNotSupported',
+    22: 'ongoingGroupCall',
     23: 'incompatibleTerminal',
-    24: 'shortTermDenial',
-    25: 'longTermDenial',
-    26: 'subscriberBusyForMT-SMS',
-    27: 'absentSubscriberSM',
-    28: 'messageWaitingListFull',
-    29: 'systemFailure',
-    30: 'dataMissing',
-    31: 'unexpectedDataValue',
-    32: 'sm-DeliveryFailure',        # confirmed by Wireshark / 3GPP TS 29.002 ASN.1
-    33: 'callBarred',
-    34: 'orNotAllowed',
-    35: 'unknownAlphabet',
-    36: 'ussd-Busy',
+    24: 'resourceLimitation',
+    25: 'noHandoverNumberAvailable',
+    26: 'subsequentHandoverFailure',
+    27: 'absentSubscriber',
+    28: 'incompatibleTerminal',
+    29: 'shortTermDenial',
+    30: 'longTermDenial',
+    # Short message service errors
+    31: 'subscriberBusyForMT-SMS',
+    32: 'sm-DeliveryFailure',
+    33: 'messageWaitingListFull',
+    # Generic / common service errors
+    34: 'systemFailure',
+    35: 'dataMissing',
+    36: 'unexpectedDataValue',
     37: 'pw-RegistrationFailure',
     38: 'negativePW-Check',
     39: 'noRoamingNumberAvailable',
     40: 'tracingBufferFull',
-    41: 'targetCellOutsideGroupCallArea',
-    42: 'numberOfPW-AttemptsViolation',
+    41: 'numberOfPW-AttemptsViolation',
+    42: 'targetCellOutsideGroupCallArea',
     43: 'numberChanged',
     44: 'busySubscriber',
     45: 'noSubscriberReply',
     46: 'forwardingFailed',
     47: 'ati-NotAllowed',
-    48: 'unauthorizedRequestingNetwork',
-    49: 'unauthorizedLCSClient',
-    50: 'positionMethodFailure',
-    51: 'unknownOrUnreachableLCSClient',
-    52: 'mm-EventNotSupported',
-    53: 'informationNotAvailable',
-    54: 'unknownAlphabet',
-    55: 'ussd-Busy',
-    56: 'illegalSubscriber',
-    57: 'deliveryFailure',
-    58: 'deactivationFailure',
-    59: 'technicalError',
+    48: 'orNotAllowed',
+    49: 'unauthorizedRequestingNetwork',
+    50: 'unauthorizedLCSClient',
+    51: 'positionMethodFailure',
+    52: 'unknownOrUnreachableLCSClient',
+    53: 'mm-EventNotSupported',
+    54: 'unauthorizedLCSClient',
+    55: 'positionMethodFailure',
+    56: 'unknownOrUnreachableLCSClient',
+    57: 'unknownOrUnreachableLCSClient',
+    58: 'mm-EventNotSupported',
+    59: 'informationNotAvailable',
+    60: 'atsi-NotAllowed',
+    61: 'atm-NotAllowed',
+    62: 'informationNotAvailable',
+    71: 'unknownAlphabet',
+    72: 'ussd-Busy',
 }
 
 # SM-DeliveryFailure sub-causes (3GPP TS 29.002 §17.6.7.4)
@@ -166,6 +178,12 @@ SM_DELIVERY_FAILURE_CAUSE: Dict[int, str] = {
     5: 'invalidSME-Address',
     6: 'subscriberNotSC-Subscriber',
 }
+
+MAP_ERROR_NAME_TO_CODE: Dict[str, int] = {}
+for _k, _v in MAP_ERROR_CODES.items():
+    if _v not in MAP_ERROR_NAME_TO_CODE:
+        MAP_ERROR_NAME_TO_CODE[_v] = _k
+SM_DELIVERY_FAILURE_CAUSE_TO_CODE: Dict[str, int] = {v: k for k, v in SM_DELIVERY_FAILURE_CAUSE.items()}
 
 # TCAP Reject problem codes (ITU-T Q.773)
 TCAP_REJECT_GENERAL: Dict[int, str] = {
@@ -200,8 +218,8 @@ TCAP_REJECT_RE: Dict[int, str] = {
 # ===========================================================================
 
 def load_config(path: str) -> bool:
-    """Load INI file into CFG / SRI_TABLE / MENU_PRESETS.  Returns True on success."""
-    global CFG, SRI_TABLE, MENU_PRESETS
+    """Load INI file into CFG / SRI_TABLE / RESPONSE_RULES / MENU_PRESETS.  Returns True on success."""
+    global CFG, SRI_TABLE, RESPONSE_RULES, MENU_PRESETS
     parser = configparser.ConfigParser(interpolation=None)
     parser.optionxform = str
     try:
@@ -210,12 +228,10 @@ def load_config(path: str) -> bool:
 
         CFG.clear()
         CFG.update({
-            # Transport
             'sctp_host': parser.get('transport', 'sctp_host', fallback=''),
             'sctp_port': parser.getint('transport', 'sctp_port', fallback=0),
             'log_file': parser.get('transport', 'log_file', fallback=''),
             'log_level': parser.get('transport', 'log_level', fallback='INFO'),
-            # Point codes and global titles
             'local_pc': parser.getint('signaling', 'local_pc', fallback=0),
             'remote_pc': parser.getint('signaling', 'remote_pc', fallback=0),
             'local_gt': parser.get('signaling', 'local_gt', fallback=''),
@@ -225,31 +241,27 @@ def load_config(path: str) -> bool:
             'vlr_gt': parser.get('signaling', 'vlr_gt', fallback=''),
             'smsc_gt': parser.get('signaling', 'smsc_gt', fallback=''),
             'fsmsc_gt': parser.get('signaling', 'fsmsc_gt', fallback=''),
-            # M3UA routing
             'route_context': parser.getint('m3ua', 'route_context', fallback=0),
             'network_indicator': parser.getint('m3ua', 'network_indicator', fallback=0),
             'ssn': parser.getint('m3ua', 'ssn', fallback=0),
             'called_ssn': parser.getint('m3ua', 'called_ssn', fallback=0),
             'calling_ssn': parser.getint('m3ua', 'calling_ssn', fallback=0),
-            # SCCP message selection
             'sccp_message_type': parser.get('sccp', 'message_type', fallback='xudt').strip().lower(),
             'sccp_hop_counter': parser.getint('sccp', 'hop_counter', fallback=15),
-            # IMSI generation defaults
             'imsi_mcc': parser.get('imsi', 'imsi_mcc', fallback=''),
             'imsi_mnc': parser.get('imsi', 'imsi_mnc', fallback=''),
-            # Example addresses shown in startup banner / menu
             'example_oa': parser.get('examples', 'example_oa', fallback=''),
             'example_da': parser.get('examples', 'example_da', fallback=''),
-            # Housekeeping
             'dialogue_ttl': parser.getint('housekeeping', 'dialogue_ttl', fallback=120),
             'cleanup_interval': parser.getint('housekeeping', 'cleanup_interval', fallback=30),
-            # MAP behavior
-            'mt_response_mode': parser.get('map', 'mt_response_mode', fallback='success'),
+            'mt_response_mode': parser.get('map', 'mt_response_mode', fallback='success').strip().lower(),
             'alert_sc_acn': parser.get('map', 'alert_sc_acn', fallback=''),
         })
 
         if CFG['sccp_message_type'] not in ('udt', 'xudt'):
             CFG['sccp_message_type'] = 'xudt'
+        if CFG['mt_response_mode'] not in ('success', 'absent', 'busy', 'error'):
+            CFG['mt_response_mode'] = 'success'
 
         sri_table: Dict[str, Dict[str, str]] = {}
         if parser.has_section('sri_table'):
@@ -265,6 +277,32 @@ def load_config(path: str) -> bool:
                     nnn, imsi = raw, ''
                 sri_table[key] = {'nnn': nnn, 'imsi': imsi}
         SRI_TABLE = sri_table
+
+        response_rules: List[Dict[str, Any]] = []
+        for sec in parser.sections():
+            if not sec.lower().startswith('response_rule:'):
+                continue
+            rule_name = sec.split(':', 1)[1].strip() or sec
+            raw_patterns = parser.get(sec, 'match', fallback=parser.get(sec, 'patterns', fallback=parser.get(sec, 'prefixes', fallback='')))
+            patterns = [p.strip() for p in raw_patterns.replace('\n', ',').split(',') if p.strip()]
+            if not patterns:
+                continue
+            rule = {
+                'name': rule_name,
+                'patterns': patterns,
+                'sri_action': parser.get(sec, 'sri_action', fallback='success').strip().lower(),
+                'sri_error': parser.get(sec, 'sri_error', fallback='').strip(),
+                'sri_nnn': parser.get(sec, 'sri_nnn', fallback=parser.get(sec, 'sri_msc_gt', fallback='')).strip(),
+                'sri_imsi': parser.get(sec, 'sri_imsi', fallback='').strip(),
+                'mt_action': parser.get(sec, 'mt_action', fallback='').strip().lower(),
+                'mt_error': parser.get(sec, 'mt_error', fallback='').strip(),
+            }
+            if rule['sri_action'] not in ('success', 'error'):
+                rule['sri_action'] = 'success'
+            if rule['mt_action'] not in ('', 'success', 'error', 'absent', 'busy'):
+                rule['mt_action'] = ''
+            response_rules.append(rule)
+        RESPONSE_RULES = response_rules
 
         MENU_PRESETS.clear()
         MENU_PRESETS.update({
@@ -1232,77 +1270,58 @@ def build_sri_sm_component(msisdn_addr: str, sc_addr: str) -> bytes:
     params   = asn1_tl(0x30, p_msisdn + p_pri + p_sca)
     return _invoke(MAP_SRI_SM, params)
 
-def build_sri_sm_response(iid: int, msisdn: str, otid: bytes) -> bytes:
-    """Build SRI-SM TCAP END response with IMSI and NNN.
-
-    IMSI / NNN resolution rules (checked in order):
-    1. Exact MSISDN match in SRI_TABLE  -> use values verbatim
-    2. Pattern match (prefix/suffix/substring key):
-         'abc*'  IMSI/NNN suffix wildcard: prefix 'abc' + last N digits of MSISDN
-                 to pad to exactly 15 digits for IMSI, or 15 for NNN.
-         'auto'  -> _generate_imsi(msisdn)  (IMSI) / msc_gt (NNN)
-         '{msisdn}' / '{msin}' -> explicit substitution placeholders
-    3. No match -> _generate_imsi() for IMSI, msc_gt for NNN
-    """
-    digs    = ''.join(ch for ch in msisdn if ch.isdigit())
+def build_sri_sm_response(iid: int, msisdn: str, otid: bytes, profile_override: Optional[Dict[str, Any]] = None) -> bytes:
+    digs = ''.join(ch for ch in msisdn if ch.isdigit())
     profile = _sri_lookup(msisdn)
-    exact   = digs in SRI_TABLE and isinstance(SRI_TABLE.get(digs), dict)
+    exact = digs in SRI_TABLE and isinstance(SRI_TABLE.get(digs), dict)
 
     def _resolve(val: str, target_len: int, fallback_fn) -> str:
-        """Resolve an IMSI or NNN template value against the current MSISDN.
-
-        val ending with '*': fill remaining digits from the tail of MSISDN.
-        val == 'auto' or empty: call fallback_fn().
-        val containing {msisdn}/{msin}: explicit substitution.
-        Plain digits: return as-is (truncated to target_len).
-        """
         if not val or val.strip().lower() == 'auto':
             return fallback_fn()
-
         if val.endswith('*'):
-            # Prefix + MSISDN tail to reach target_len digits
             prefix = ''.join(c for c in val[:-1] if c.isdigit())
-            need   = target_len - len(prefix)
+            need = target_len - len(prefix)
             if need <= 0:
                 return prefix[:target_len]
-            # Take the last `need` digits of MSISDN; pad with leading zeros if short
             tail = digs[-need:] if len(digs) >= need else digs.zfill(need)
             return (prefix + tail)[:target_len]
-
-        # {msisdn} / {msin} substitution
         if '{' in val:
-            msin_len = max(1, target_len - 5)   # reasonable MSIN length estimate
+            msin_len = max(1, target_len - 5)
             msin = digs[-msin_len:] if len(digs) >= msin_len else digs.zfill(msin_len)
-            val  = val.replace('{msisdn}', digs).replace('{msin}', msin)
-
+            val = val.replace('{msisdn}', digs).replace('{msin}', msin)
+            return ''.join(c for c in val if c.isdigit())[:target_len]
         return ''.join(c for c in val if c.isdigit())[:target_len]
 
-    if profile:
+    raw_imsi = raw_nnn = ''
+    override = profile_override or {}
+    if override:
+        raw_imsi = str(override.get('sri_imsi', '') or '')
+        raw_nnn = str(override.get('sri_nnn', '') or '')
+    if not raw_imsi and profile:
         raw_imsi = str(profile.get('imsi', ''))
-        raw_nnn  = str(profile.get('nnn',  ''))
-        if exact:
-            # Exact match: verbatim digits, no wildcard expansion
-            imsi   = ''.join(c for c in raw_imsi if c.isdigit()) or _generate_imsi(msisdn)
-            nnn_gt = ''.join(c for c in raw_nnn  if c.isdigit()) or str(CFG.get('msc_gt', ''))
+    if not raw_nnn and profile:
+        raw_nnn = str(profile.get('nnn', ''))
+
+    if raw_imsi or raw_nnn:
+        if exact and not override:
+            imsi = ''.join(c for c in raw_imsi if c.isdigit()) or _generate_imsi(msisdn)
+            nnn_gt = ''.join(c for c in raw_nnn if c.isdigit()) or str(CFG.get('msc_gt', ''))
         else:
-            imsi   = _resolve(raw_imsi, 15, lambda: _generate_imsi(msisdn))
-            nnn_gt = _resolve(raw_nnn,  15, lambda: str(CFG.get('msc_gt', '')))
+            imsi = _resolve(raw_imsi, 15, lambda: _generate_imsi(msisdn))
+            nnn_gt = _resolve(raw_nnn, 15, lambda: str(CFG.get('msc_gt', '')))
     else:
-        imsi   = _generate_imsi(msisdn)
+        imsi = _generate_imsi(msisdn)
         nnn_gt = str(CFG.get('msc_gt', ''))
 
-    # Safety truncation
-    imsi   = imsi[:15]
+    imsi = imsi[:15]
     nnn_gt = nnn_gt[:15]
-
     imsi_el = asn1_tl(0x04, bcd_encode(imsi))
-    nnn_as  = bytes([0x91]) + bcd_encode(nnn_gt)
-    li      = asn1_tl(0xA0, asn1_tl(0x81, nnn_as))
-    params  = imsi_el + li
-
+    nnn_as = bytes([0x91]) + bcd_encode(nnn_gt)
+    li = asn1_tl(0xA0, asn1_tl(0x81, nnn_as))
+    params = imsi_el + li
     component = _return_result(iid, MAP_SRI_SM, params)
-    dtid  = asn1_tl(0x49, otid)
-    dlg   = build_dialogue_portion(ACN_SRI_SM, is_request=False)
+    dtid = asn1_tl(0x49, otid)
+    dlg = build_dialogue_portion(ACN_SRI_SM, is_request=False)
     return asn1_tl(TCAP_END, dtid + dlg + component)
 
 def build_mt_fsm_component(imsi: str, sc_addr: str, tpdu: bytes) -> bytes:
@@ -1802,6 +1821,143 @@ def _validate_gt(gt: str) -> Optional[str]:
         digits = digits[:15]    # E.164 max length
     return digits
 
+def _digits_only(value: str) -> str:
+    return ''.join(ch for ch in str(value or '') if ch.isdigit())
+
+def _match_pattern_len(pattern: str, value: str) -> int:
+    p = str(pattern or '').strip()
+    v = _digits_only(value)
+    if not p or not v:
+        return -1
+    if ':' in p:
+        _, p = p.split(':', 1)
+        p = p.strip()
+    pd = _digits_only(p)
+    if not pd:
+        return -1
+    ps, pe = p.startswith('*'), p.endswith('*')
+    if ps and pe and len(pd) > 0:
+        return len(pd) if pd in v else -1
+    if pe and not ps:
+        return len(pd) if v.startswith(pd) else -1
+    if ps and not pe:
+        return len(pd) if v.endswith(pd) else -1
+    return len(pd) if v == pd else -1
+
+def _find_response_rule(msisdn: str = '', imsi: str = '') -> Optional[Dict[str, Any]]:
+    best_rule = None
+    best_score = (-1, -1)
+    msisdn_digits = _digits_only(msisdn)
+    imsi_digits = _digits_only(imsi)
+    for rule in RESPONSE_RULES:
+        for raw_pattern in rule.get('patterns', []):
+            p = str(raw_pattern or '').strip()
+            if not p:
+                continue
+            namespace = 'generic'
+            target = msisdn_digits
+            if ':' in p:
+                ns, _ = p.split(':', 1)
+                namespace = ns.strip().lower()
+            if namespace == 'imsi':
+                target = imsi_digits
+            elif namespace in ('msisdn', 'generic'):
+                target = msisdn_digits or imsi_digits
+            score_len = _match_pattern_len(p, target)
+            if score_len < 0:
+                continue
+            score = (score_len, 1 if namespace != 'generic' else 0)
+            if score > best_score:
+                best_score = score
+                best_rule = rule
+    return best_rule
+
+def _map_error_name_to_component(iid: int, error_name: str) -> bytes:
+    name = str(error_name or '').strip()
+    if not name:
+        return _return_error(iid, 34)
+    if name in SM_DELIVERY_FAILURE_CAUSE_TO_CODE:
+        cause = SM_DELIVERY_FAILURE_CAUSE_TO_CODE[name]
+        params = asn1_tl(0x30, asn1_tl(0x0A, bytes([cause & 0xFF])))
+        return _return_error(iid, 32, params)
+    code = MAP_ERROR_NAME_TO_CODE.get(name)
+    if code is None:
+        aliases = {
+            'busy': 31,
+            'subscriberBusyForMTSMS': 31,
+            'subscriberBusyForMT-SMS': 31,
+            'absent': 6,
+            'absentSubscriber': 27,
+        }
+        code = aliases.get(name)
+    if code is None:
+        code = 34
+    return _return_error(iid, code)
+
+def _reverse_msisdn_from_imsi(imsi: str) -> Optional[str]:
+    imsi_digits = _digits_only(imsi)
+    if not imsi_digits:
+        return None
+    for key, value in SRI_TABLE.items():
+        if '*' in str(key):
+            continue
+        candidate = _digits_only((value or {}).get('imsi', ''))
+        if candidate and candidate == imsi_digits:
+            return _digits_only(key)
+    return None
+
+def _parse_mt_fsm_target(tcap: bytes) -> Dict[str, Optional[str]]:
+    result = {'imsi': None, 'msisdn': None}
+    try:
+        cp = extract_component_bytes(tcap)
+        if not cp:
+            return result
+        top = asn1_read(cp, 0)
+        if not top or top[0] != 0x6C:
+            return result
+        inv = asn1_read(cp, top[2])
+        if not inv or inv[0] != 0xA1:
+            return result
+        off = inv[2]
+        while off < inv[3]:
+            n = asn1_read(cp, off)
+            if not n:
+                break
+            tag, _, nvs, nve, off = n
+            if tag != 0x30:
+                continue
+            p = nvs
+            while p < nve:
+                pn = asn1_read(cp, p)
+                if not pn:
+                    break
+                pt, _, pvs, pve, p = pn
+                val = cp[pvs:pve]
+                if pt == 0x80 and val and result['imsi'] is None:
+                    result['imsi'] = bcd_decode(val)
+                elif pt == 0x81 and len(val) > 1 and result['msisdn'] is None:
+                    result['msisdn'] = bcd_decode(val[1:])
+            break
+    except Exception:
+        pass
+    if not result['msisdn'] and result['imsi']:
+        result['msisdn'] = _reverse_msisdn_from_imsi(result['imsi'])
+    return result
+
+def _build_sri_sm_error_response(iid: int, error_name: str, otid: bytes) -> bytes:
+    component = _map_error_name_to_component(iid, error_name)
+    dtid = asn1_tl(0x49, otid)
+    dlg = build_dialogue_portion(ACN_SRI_SM, is_request=False)
+    return asn1_tl(TCAP_END, dtid + dlg + component)
+
+def _flow_to_log_op(flow: str):
+    return {
+        'MO': MAP_MO_FSM,
+        'MT': MAP_MT_FSM,
+        'SRI': MAP_SRI_SM,
+        'ALERT_SC': MAP_ALERT_SC,
+    }.get(flow)
+
 def _sri_lookup(msisdn: str) -> Dict:
     """Look up SRI response profile for msisdn.
     Supports: exact, prefix (abc*), suffix (*abc), substring (*abc*).
@@ -1869,47 +2025,50 @@ def _op_name(op_code) -> str:
 def format_map_log_line(direction: str, opc: int, dpc: int,
                         calling_gt: Optional[str], called_gt: Optional[str],
                         tcap: bytes, op_code=None) -> str:
-    """Build a single structured log line for a MAP PDU."""
-    # TID
     tid = get_dtid(tcap) or get_otid(tcap)
     tid_str = tid.hex() if tid else '-'
 
-    # Component type suffix
     ct = get_component_tag(tcap)
-    ack_sfx = ' returnResultLast' if ct == 0xA2 else ''
+    comp_sfx = {
+        0xA1: ' invoke',
+        0xA2: ' returnResultLast',
+        0xA3: ' returnError',
+        0xA4: ' reject',
+    }.get(ct, '')
 
-    # Operation name — fall back to TCAP primitive name
     op_n = _op_name(op_code)
     if op_n == '-' and tcap:
         op_n = _TCAP_NAMES.get(tcap[0], f'TCAP-0x{tcap[0]:02X}')
 
-    # SCA (for invokes only)
     sca = '-'
     if ct == 0xA1:
         sca = _extract_sca(tcap, op_code) or 'NA'
 
-    # Extra: SMS content preview + OA/DA addresses
     extra = ''
     try:
+        if ct in (0xA3, 0xA4):
+            err = parse_tcap_error(tcap)
+            if err:
+                extra += f' {err}'
+
         if isinstance(op_code, int) and op_code in (MAP_MO_FSM, MAP_MT_FSM):
             cp = extract_component_bytes(tcap)
             if cp:
-                # Extract OA/DA from MAP component parameters
                 oa_da = _extract_oa_da(cp, op_code)
                 for blob in _iter_octet_strings(cp):
                     tpdu = _extract_tpdu_from_blob(blob)
                     pid, dcs, prev = parse_tpdu_preview(tpdu, 160) if tpdu else (None, None, None)
                     if pid is not None and dcs is not None and prev is not None:
-                        extra = (f"{oa_da}"
-                                 f" PID=0x{pid:02X} DCS=0x{dcs:02X}"
-                                 f" LEN={len(prev)} TXT='{prev}'")
+                        extra += (f"{oa_da}"
+                                  f" PID=0x{pid:02X} DCS=0x{dcs:02X}"
+                                  f" LEN={len(prev)} TXT='{prev}'")
                         break
                 if not extra and oa_da:
-                    extra = oa_da
+                    extra += oa_da
         elif isinstance(op_code, int) and op_code == MAP_SRI_SM and ct == 0xA2:
             imsi, nnn = parse_sri_sm_result(tcap)
             if imsi or nnn:
-                extra = f" IMSI={imsi or '-'} NNN={nnn or '-'}"
+                extra += f" IMSI={imsi or '-'} NNN={nnn or '-'}"
     except Exception:
         pass
 
@@ -1917,7 +2076,7 @@ def format_map_log_line(direction: str, opc: int, dpc: int,
             f"TID={tid_str} "
             f"{calling_gt or '-'} -> {called_gt or '-':<18} "
             f"SCA={sca:<14} "
-            f"{op_n}{ack_sfx}{extra}")
+            f"{op_n}{comp_sfx}{extra}")
 
 def _iter_octet_strings(buf: bytes):
     """Yield raw values of all 0x04 OCTET STRING TLVs found anywhere in buf."""
@@ -2461,12 +2620,12 @@ class STPServer:
                     p = parse_tcap(tcap)
                     ct = get_component_tag(tcap)
                     flow = tx['type']
+                    op_for_log = _flow_to_log_op(flow) or p['op_code']
                     seg_info = (f" seg {tx['seg']}/{tx['total']}"
                                 if 'seg' in tx else '')
                     if ct == 0xA2:
-                        # TC-END with ReturnResultLast — normal ack
                         self._log_pdu('Recv', opc, dpc, calling.get('gt'), called.get('gt'),
-                                      tcap, p['op_code'])
+                                      tcap, op_for_log)
                         self._debug(f"TID matched: {flow}{seg_info} ack (RRL) "
                                     f"(DTID={key}) from {calling.get('gt','?')}")
                         if flow == 'MO':
@@ -2477,9 +2636,8 @@ class STPServer:
                             self.stats.inc('alert_sc_acked')
                             self._info(f"[alertSC] Acked by SMSC — subscriber retry should follow")
                     elif ct == -1:
-                        # TC-END with no component — also a valid ack
                         self._log_pdu('Recv', opc, dpc, calling.get('gt'), called.get('gt'),
-                                      tcap, p['op_code'])
+                                      tcap, op_for_log)
                         self._debug(f"TID matched: {flow}{seg_info} ack (empty TC-END) "
                                     f"(DTID={key}) from {calling.get('gt','?')}")
                         if flow == 'MO':
@@ -2490,12 +2648,25 @@ class STPServer:
                             self.stats.inc('alert_sc_acked')
                             self._info(f"[alertSC] Acked by SMSC — subscriber retry should follow")
                     else:
-                        # TC-END with error component (ReturnError/Reject)
                         err_desc = parse_tcap_error(tcap)
                         self._log_pdu('Recv', opc, dpc, calling.get('gt'), called.get('gt'),
-                                      tcap, p['op_code'])
+                                      tcap, op_for_log)
                         self._error(f"[{flow}{seg_info}] TID={key}  {err_desc}")
                     return
+
+                # SRI-SM error correlation (outgoing SRI-SM got ReturnError / Reject)
+                p = parse_tcap(tcap)
+                ct = get_component_tag(tcap)
+                if ct in (0xA3, 0xA4):
+                    with self._mt_lock:
+                        sri_ctx = self._pending_mt.pop(key, None)
+                    if sri_ctx:
+                        self._log_pdu('Recv', opc, dpc, calling.get('gt'), called.get('gt'),
+                                      tcap, MAP_SRI_SM)
+                        err_desc = parse_tcap_error(tcap)
+                        self.stats.inc('sri_aborted')
+                        self._error(f"[SRI] TID={key}  {err_desc}")
+                        return
 
         elif tcap[0] == TCAP_ABORT:
             dtid = get_dtid(tcap)
@@ -2548,8 +2719,18 @@ class STPServer:
         if isinstance(op, int) and p['invoke_id'] is not None:
             if op == MAP_SRI_SM and p['msisdn']:
                 self.stats.inc('sri_rx')
-                resp_tcap = build_sri_sm_response(p['invoke_id'], p['msisdn'],
-                                                  p['otid'] or p['dtid'])
+                rule = _find_response_rule(msisdn=p['msisdn'])
+                if rule and str(rule.get('sri_action') or '').lower() == 'error':
+                    err_name = rule.get('sri_error') or 'unknownSubscriber'
+                    self._info(f"[SRI-SM rule] msisdn={p['msisdn']} rule={rule.get('name')} action=error error={err_name}")
+                    resp_tcap = _build_sri_sm_error_response(p['invoke_id'], err_name,
+                                                             p['otid'] or p['dtid'])
+                else:
+                    if rule:
+                        self._info(f"[SRI-SM rule] msisdn={p['msisdn']} rule={rule.get('name')} action=success")
+                    resp_tcap = build_sri_sm_response(p['invoke_id'], p['msisdn'],
+                                                      p['otid'] or p['dtid'],
+                                                      profile_override=rule)
 
             elif op == MAP_MT_FSM:
                 self.stats.inc('mt_rx')
@@ -2671,45 +2852,52 @@ class STPServer:
         return 'outcome=unknown'
 
     def _build_mt_fsm_response(self, invoke_id: int, req_tcap: bytes) -> bytes:
-        """Build MT-FSM response based on current mt_response_mode.
-
-        Modes (set via 'mtmode' command or CFG['mt_response_mode']):
-          'success' — ReturnResultLast (normal delivery ack)
-          'absent'  — ReturnError absentSubscriberSM (code 27)
-                      SMSC will buffer message and send alertServiceCentre later
-          'busy'    — ReturnError subscriberBusyForMT-SMS (code 26)
-        """
-        mode = CFG.get('mt_response_mode', 'success').lower()
         peer_otid = get_otid(req_tcap)
-        if not peer_otid: return b''
+        if not peer_otid:
+            return b''
 
+        target = _parse_mt_fsm_target(req_tcap)
+        rule = _find_response_rule(msisdn=target.get('msisdn') or '', imsi=target.get('imsi') or '')
+
+        mode = CFG.get('mt_response_mode', 'success').lower()
+        error_name = None
+        if rule and rule.get('mt_action'):
+            ra = str(rule.get('mt_action') or '').lower()
+            if ra in ('error', 'absent', 'busy'):
+                mode = ra
+                error_name = rule.get('mt_error') or None
+            elif ra == 'success':
+                mode = 'success'
+            self._info(f"[MT-FSM rule] target_msisdn={target.get('msisdn') or '-'} imsi={target.get('imsi') or '-'} rule={rule.get('name')} mode={mode} error={error_name or '-'}")
+
+        if mode == 'error':
+            err = _map_error_name_to_component(invoke_id, error_name or 'absentSubscriberSM')
+            return build_tcap_end(peer_otid, err,
+                                  include_dialogue=(req_tcap[0] == TCAP_BEGIN),
+                                  acn=ACN_MT_RELAY)
         if mode == 'absent':
             self.stats.inc('mt_rejected_absent')
-            err = _return_error(invoke_id, 27)   # absentSubscriberSM
-            self._info(f"[MT-FSM] Responding ReturnError absentSubscriberSM "
-                       f"(mode=absent) — SMSC should buffer and retry via alertSC")
+            err = _map_error_name_to_component(invoke_id, error_name or 'absentSubscriberSM')
+            self._info(f"[MT-FSM] Responding ReturnError {error_name or 'absentSubscriberSM'} (mode=absent/error)")
             return build_tcap_end(peer_otid, err,
                                   include_dialogue=(req_tcap[0] == TCAP_BEGIN),
                                   acn=ACN_MT_RELAY)
-
         if mode == 'busy':
             self.stats.inc('mt_rejected_busy')
-            err = _return_error(invoke_id, 26)   # subscriberBusyForMT-SMS
-            self._info(f"[MT-FSM] Responding ReturnError subscriberBusyForMT-SMS (mode=busy)")
+            err = _map_error_name_to_component(invoke_id, error_name or 'subscriberBusyForMT-SMS')
+            self._info(f"[MT-FSM] Responding ReturnError {error_name or 'subscriberBusyForMT-SMS'} (mode=busy)")
             return build_tcap_end(peer_otid, err,
                                   include_dialogue=(req_tcap[0] == TCAP_BEGIN),
                                   acn=ACN_MT_RELAY)
 
-        # Default: success
         final = is_final_mt_segment(req_tcap, invoke_id)
-        ack   = _return_result_ack(invoke_id)
+        ack = _return_result_ack(invoke_id)
         if req_tcap[0] == TCAP_CONTINUE and not final:
             our = get_dtid(req_tcap) or new_otid()
             return build_tcap_continue(our, peer_otid, ack)
-        else:
-            return build_tcap_end(peer_otid, ack,
-                                  include_dialogue=(req_tcap[0] == TCAP_BEGIN),
-                                  acn=ACN_MT_RELAY)
+        return build_tcap_end(peer_otid, ack,
+                              include_dialogue=(req_tcap[0] == TCAP_BEGIN),
+                              acn=ACN_MT_RELAY)
 
     # ------------------------------------------------------------------
     # Outgoing dialogue continuation handlers
